@@ -50215,32 +50215,6 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     return res2;
 }
 
-static JSValue promise_rejection_tracker_job(JSContext *ctx, int argc,
-                                             JSValueConst *argv)
-{
-    JSRuntime *rt;
-    JSPromiseData *s;
-    JSValueConst promise;
-
-    assert(argc == 1);
-
-    rt = ctx->rt;
-    promise = argv[0];
-    s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
-
-    if (!s || s->promise_state != JS_PROMISE_REJECTED)
-        return JS_UNDEFINED; /* should never happen */
-
-    promise_trace(ctx, "promise_rejection_tracker_job\n");
-
-    // Check again in case the hook was removed.
-    if (rt->host_promise_rejection_tracker)
-        rt->host_promise_rejection_tracker(
-            ctx, promise, s->promise_result, s->is_handled, rt->host_promise_rejection_tracker_opaque);
-
-    return JS_UNDEFINED;
-}
-
 void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook promise_hook, void *opaque)
 {
     rt->promise_hook = promise_hook;
@@ -50258,50 +50232,45 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt,
 static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
                                       JSValueConst value, bool is_reject)
 {
-    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
-    struct list_head *el, *el1;
-    JSPromiseReactionData *rd;
-    JSValueConst args[5];
+  JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+  struct list_head *el, *el1;
+  JSPromiseReactionData *rd;
+  JSValueConst args[5];
 
-    if (!s || s->promise_state != JS_PROMISE_PENDING)
-        return; /* should never happen */
-    set_value(ctx, &s->promise_result, js_dup(value));
-    s->promise_state = JS_PROMISE_FULFILLED + is_reject;
-
-    promise_trace(ctx, "fulfill_or_reject_promise: is_reject=%d\n", is_reject);
-
-    if (s->promise_state == JS_PROMISE_FULFILLED) {
-        JSRuntime *rt = ctx->rt;
-        if (rt->promise_hook) {
-            rt->promise_hook(ctx, JS_PROMISE_HOOK_RESOLVE, promise,
-                             JS_UNDEFINED, rt->promise_hook_opaque);
-        }
+  if (!s || s->promise_state != JS_PROMISE_PENDING)
+    return; /* should never happen */
+  set_value(ctx, &s->promise_result, JS_DupValue(ctx, value));
+  s->promise_state = JS_PROMISE_FULFILLED + is_reject;
+#ifdef DUMP_PROMISE
+  printf("fulfill_or_reject_promise: is_reject=%d\n", is_reject);
+#endif
+  if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
+    JSRuntime *rt = ctx->rt;
+    if (rt->host_promise_rejection_tracker) {
+      rt->host_promise_rejection_tracker(ctx, promise, value, FALSE,
+                                         rt->host_promise_rejection_tracker_opaque);
     }
+  }
 
-    list_for_each_safe(el, el1, &s->promise_reactions[is_reject]) {
-        rd = list_entry(el, JSPromiseReactionData, link);
-        args[0] = rd->resolving_funcs[0];
-        args[1] = rd->resolving_funcs[1];
-        args[2] = rd->handler;
-        args[3] = js_bool(is_reject);
-        args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
-        list_del(&rd->link);
-        promise_reaction_data_free(ctx->rt, rd);
-    }
+  list_for_each_safe(el, el1, &s->promise_reactions[is_reject]) {
+    rd = list_entry(el, JSPromiseReactionData, link);
+    args[0] = rd->resolving_funcs[0];
+    args[1] = rd->resolving_funcs[1];
+    args[2] = rd->handler;
+    args[3] = JS_NewBool(ctx, is_reject);
+    args[4] = value;
+    JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+    list_del(&rd->link);
+    promise_reaction_data_free(ctx->rt, rd);
+  }
 
-    list_for_each_safe(el, el1, &s->promise_reactions[1 - is_reject]) {
-        rd = list_entry(el, JSPromiseReactionData, link);
-        list_del(&rd->link);
-        promise_reaction_data_free(ctx->rt, rd);
-    }
-
-    if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
-        JSRuntime *rt = ctx->rt;
-        if (rt->host_promise_rejection_tracker)
-            JS_EnqueueJob(ctx, promise_rejection_tracker_job, 1, &promise);
-    }
+  list_for_each_safe(el, el1, &s->promise_reactions[1 - is_reject]) {
+    rd = list_entry(el, JSPromiseReactionData, link);
+    list_del(&rd->link);
+    promise_reaction_data_free(ctx->rt, rd);
+  }
 }
+
 
 static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
                                                int argc, JSValueConst *argv)
@@ -51017,52 +50986,54 @@ static __exception int perform_promise_then(JSContext *ctx,
                                             JSValueConst *resolve_reject,
                                             JSValueConst *cap_resolving_funcs)
 {
-    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
-    JSPromiseReactionData *rd_array[2], *rd;
-    int i, j;
+  JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+  JSPromiseReactionData *rd_array[2], *rd;
+  int i, j;
 
-    rd_array[0] = NULL;
-    rd_array[1] = NULL;
-    for(i = 0; i < 2; i++) {
-        JSValueConst handler;
-        rd = js_mallocz(ctx, sizeof(*rd));
-        if (!rd) {
-            if (i == 1)
-                promise_reaction_data_free(ctx->rt, rd_array[0]);
-            return -1;
-        }
-        for(j = 0; j < 2; j++)
-            rd->resolving_funcs[j] = js_dup(cap_resolving_funcs[j]);
-        handler = resolve_reject[i];
-        if (!JS_IsFunction(ctx, handler))
-            handler = JS_UNDEFINED;
-        rd->handler = js_dup(handler);
-        rd_array[i] = rd;
+  rd_array[0] = NULL;
+  rd_array[1] = NULL;
+  for(i = 0; i < 2; i++) {
+    JSValueConst handler;
+    rd = js_mallocz(ctx, sizeof(*rd));
+    if (!rd) {
+      if (i == 1)
+        promise_reaction_data_free(ctx->rt, rd_array[0]);
+      return -1;
     }
+    for(j = 0; j < 2; j++)
+      rd->resolving_funcs[j] = JS_DupValue(ctx, cap_resolving_funcs[j]);
+    handler = resolve_reject[i];
+    if (!JS_IsFunction(ctx, handler))
+      handler = JS_UNDEFINED;
+    rd->handler = JS_DupValue(ctx, handler);
+    rd_array[i] = rd;
+  }
 
-    if (s->promise_state == JS_PROMISE_PENDING) {
-        for(i = 0; i < 2; i++)
-            list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
-    } else {
-        JSValueConst args[5];
-        if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
-            JSRuntime *rt = ctx->rt;
-            if (rt->host_promise_rejection_tracker)
-                JS_EnqueueJob(ctx, promise_rejection_tracker_job, 1, &promise);
-        }
-        i = s->promise_state - JS_PROMISE_FULFILLED;
-        rd = rd_array[i];
-        args[0] = rd->resolving_funcs[0];
-        args[1] = rd->resolving_funcs[1];
-        args[2] = rd->handler;
-        args[3] = js_bool(i);
-        args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
-        for(i = 0; i < 2; i++)
-            promise_reaction_data_free(ctx->rt, rd_array[i]);
+  if (s->promise_state == JS_PROMISE_PENDING) {
+    for(i = 0; i < 2; i++)
+      list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
+  } else {
+    JSValueConst args[5];
+    if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
+      JSRuntime *rt = ctx->rt;
+      if (rt->host_promise_rejection_tracker) {
+        rt->host_promise_rejection_tracker(ctx, promise, s->promise_result,
+                                           TRUE, rt->host_promise_rejection_tracker_opaque);
+      }
     }
-    s->is_handled = true;
-    return 0;
+    i = s->promise_state - JS_PROMISE_FULFILLED;
+    rd = rd_array[i];
+    args[0] = rd->resolving_funcs[0];
+    args[1] = rd->resolving_funcs[1];
+    args[2] = rd->handler;
+    args[3] = JS_NewBool(ctx, i);
+    args[4] = s->promise_result;
+    JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+    for(i = 0; i < 2; i++)
+      promise_reaction_data_free(ctx->rt, rd_array[i]);
+  }
+  s->is_handled = TRUE;
+  return 0;
 }
 
 static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
